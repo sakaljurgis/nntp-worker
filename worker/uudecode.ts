@@ -2,11 +2,16 @@
 import { Attachment } from './types';
 import * as crypto from 'crypto';
 
+// Decodes one uuencoded character to its 6-bit value. Reading past the end of
+// the line yields 0, which handles encoders that strip trailing spaces.
+const decodeChar = (line: string, index: number) => (line.charCodeAt(index) - 32) & 0x3F;
+
 function uudecode(uuencodedText: string) {
   // Regular expressions to identify UUencoded content
   const beginRegex = /^begin\s+(\d+)\s+(\S+)\s*$/;
   const endRegex = /^end\s*$/;
-  const uuLineRegex = /^[M-` ]/;
+  // The first char encodes the line length: ' ' (0) .. 'M' (45), '`' is an alternative 0
+  const uuLineRegex = /^[ -`]/;
 
   // Split input into lines
   const lines = uuencodedText.split(/\r?\n/);
@@ -14,7 +19,7 @@ function uudecode(uuencodedText: string) {
   let collecting = false;
   let fileName = null;
   let fileMode = null;
-  let encodedData = [];
+  const encodedLines: string[] = [];
 
   // Extract the UUencoded portion
   for (const line of lines) {
@@ -33,35 +38,32 @@ function uudecode(uuencodedText: string) {
       continue;
     }
 
-    // Collect UUencoded lines
-    if (collecting && uuLineRegex.test(line)) {
-      encodedData.push(line);
+    // Collect UUencoded lines, skipping empty ones
+    if (collecting && line.length > 1 && uuLineRegex.test(line)) {
+      encodedLines.push(line);
     }
   }
 
-  // Actual UUdecoding
-  let decodedData = new Uint8Array(encodedData.reduce((acc, line) => {
-    if (line.length <= 1) return acc; // Skip empty lines
+  // Actual UUdecoding into a preallocated buffer, so the cost stays linear in the input size.
+  const totalLength = encodedLines.reduce((sum, line) => sum + decodeChar(line, 0), 0);
+  const decodedData = new Uint8Array(totalLength);
+  let offset = 0;
 
-    // First character of each line indicates the length
-    const length = (line.charCodeAt(0) - 32) & 0x3F;
-    if (length === 0) return acc; // Skip zero-length lines
+  for (const line of encodedLines) {
+    const lineEnd = offset + decodeChar(line, 0);
 
-    // Process the line in groups of 4 characters
-    const bytes = [];
-    for (let i = 1; i < line.length; i += 4) {
-      if (i + 3 >= line.length) break;
+    // Each group of 4 characters decodes into 3 bytes
+    for (let i = 1; offset < lineEnd; i += 4) {
+      const c0 = decodeChar(line, i);
+      const c1 = decodeChar(line, i + 1);
+      const c2 = decodeChar(line, i + 2);
+      const c3 = decodeChar(line, i + 3);
 
-      // Decode each group of 4 characters into 3 bytes
-      const chars = line.slice(i, i + 4).split('').map(c => (c.charCodeAt(0) - 32) & 0x3F);
-
-      if (bytes.length < length) bytes.push((chars[0] << 2) | (chars[1] >> 4));
-      if (bytes.length < length) bytes.push(((chars[1] & 0x0F) << 4) | (chars[2] >> 2));
-      if (bytes.length < length) bytes.push(((chars[2] & 0x03) << 6) | chars[3]);
+      decodedData[offset++] = (c0 << 2) | (c1 >> 4);
+      if (offset < lineEnd) decodedData[offset++] = ((c1 & 0x0F) << 4) | (c2 >> 2);
+      if (offset < lineEnd) decodedData[offset++] = ((c2 & 0x03) << 6) | c3;
     }
-
-    return acc.concat(bytes);
-  }, [] as number[]));
+  }
 
   return {
     fileName,
@@ -93,19 +95,11 @@ export async function extractAllUUEncodedAttachments(messageText: string) {
     }
   }
 
-  // remove the decoded data from the text message
-  let text = '';
-  if (positions.length === 0) {
-    text = messageText;
-  }
-
-  if (positions.length > 1) {
-    // remove one by one in reverse order
-    text = messageText;
-    for (let i = positions.length - 1; i >= 0; i--) {
-      const [startPos, endPos] = positions[i];
-      text = text.substring(0, startPos) + text.substring(endPos);
-    }
+  // remove the decoded data from the text message, in reverse order so earlier positions stay valid
+  let text = messageText;
+  for (let i = positions.length - 1; i >= 0; i--) {
+    const [startPos, endPos] = positions[i];
+    text = text.substring(0, startPos) + text.substring(endPos);
   }
 
   // for (let i = 0; i < positions.length; i++) {
